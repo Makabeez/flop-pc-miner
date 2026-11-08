@@ -1,0 +1,8 @@
+# never commit miner state or secrets
+miner.env
+*.seed
+signer
+address
+.env*
+__pycache__/
+*.log
