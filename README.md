@@ -93,6 +93,7 @@ Everything here was written to be checked, not trusted:
 - **Nothing listens on your network.** The backend has no published port. The worker listens on `127.0.0.1` only. The only way in from the internet is a Cloudflare quick tunnel to the worker's session port, which answers `401` without a 64-character session token.
 - **A new, devnet-only key.** `setup` generates a fresh miner key inside the distro and never prints it. Your real wallets are never involved, and nothing ever asks for a seed phrase. The seed files are root-owned, mode `600`, in `/opt/flop-miner`.
 - **The stake comes from Flop's sponsor.** The sponsor request sends only your miner address, a timestamp and a signature, and the script refuses to sign if the sponsor reports a different chain.
+- **One community tool, pinned and checked.** `setup` installs the signer-fence guard from [UfukNode/flop-miner-setup](https://github.com/UfukNode/flop-miner-setup/tree/ad2d5224cc6e258e8dadf47b9f98126e4816055b/fence-guard), downloaded at one reviewed commit and checked file by file against sha256 values in `flop-miner.sh` before anything is installed. It only reads the chain and never signs or sends a transaction ([what it does](#no-work-for-hours-check-the-signer-fence)).
 - **The dashboard is local and read-only.** It binds to `127.0.0.1:8650` and never reads or serves your seeds or tokens.
 
 Read [`flop-miner.sh`](flop-miner.sh) before running it. It is one file, and every step is commented.
@@ -181,8 +182,9 @@ What `setup` does, in order:
 3. Pulls the images by digest. This takes a while: about 23 GB.
 4. Generates your miner key and prints the **miner address**.
 5. Asks Flop's **stake sponsor** for a stake, then waits as long as the sponsor asks between tries. The sponsor can be busy or full: at most 40 uncalibrated miners at a time. Pressing Ctrl+C is safe; continue later with `./flop-miner.sh sponsor`.
-6. Downloads the model with Flop's CLI, which checks every file against the on-chain record.
+6. Downloads the model with Flop's CLI, which checks every file against the on-chain record. On a later run it keeps the copy already on disk: the worker re-verifies it at every start (`model-gate OK`).
 7. Installs cloudflared and the `flop-tunnel` service.
+8. Installs the signer-fence guard and its 2-minute timer ([why](#no-work-for-hours-check-the-signer-fence)).
 
 ### 5. Lock the distro down (recommended)
 
@@ -265,6 +267,7 @@ All settings are kept in `/opt/flop-miner/miner.env` and survive restarts.
 | `./flop-miner.sh toploc on\|off` | **on** | The TOPLOC activation proof. Keep it **on**: backend v0.1.239 rejects requests without it ("toploc binding required"). |
 | `GPU_UTIL=0.5 ./flop-miner.sh setup` | 0.6 | Share of VRAM the backend reserves. Lower it if the backend runs out of memory or you want VRAM for other apps. |
 | `WORKER_NAME=… ./flop-miner.sh setup` | `flop-pc-miner` | Your public worker label |
+| `./flop-miner.sh fence [install]` | guard **on** | Signer-fence status; `install` sets up or refreshes the guard |
 
 Run them like this:
 
@@ -283,11 +286,14 @@ Every one of these happened on the test PC.
 | `run this inside the flop-miner WSL distro` | A plain `wsl` opened your default distro | Always use `wsl -d flop-miner` |
 | Sponsor: `503`, `signer balance too low`, `auto_miner_cap_full` | The sponsor is down, out of funds, or full (40 uncalibrated miners max) | Nothing; the script waits `retryAfterSeconds` and retries. Or run `./flop-miner.sh sponsor` later |
 | `MODEL_VERIFICATION_FAILED` | The CLI in `releases.json` is older than the chain runtime | Already handled: the script uses the official CLI v0.1.290 or newer from the same org |
+| `MODEL_VERIFICATION_FAILED` … `--output-dir … is not empty` when re-running setup | The CLI only writes a model into an empty folder | Fixed in v1.1.0: setup keeps the model already on disk (the worker re-verifies it). Force a fresh copy with `REFETCH_MODEL=1 ./flop-miner.sh setup` |
+| Healthy dashboard, but **no sessions for hours**; `./flop-miner.sh fence` says `fenced: yes` | An RPC drop left a transaction unconfirmed, so the worker locked its signer and answers `503` | The fence guard clears it, usually within ~20 min. See [the signer fence](#no-work-for-hours-check-the-signer-fence). Never delete the fence file by hand |
+| Host has internet but the **container doesn't** (`chain … drops`, `mailbox unreachable`, raw TCP from the worker times out) | WSL's network path into Docker broke | Stop, wait 30 s, Start. Stop terminates the distro, which resets it; restarting only the worker does not |
 | Calibration `No response received from RPC endpoint`, chain link dropping, `1006` every ~13 s | WSL's link MTU (1280 on some PCs) is smaller than Docker's 1500 | Already handled: `up` matches the miner network's MTU to `eth0` |
 | Session error `V2 leaf cannot bind a TOPLOC activation commitment (fail closed)` | worker v0.1.286 + backend v0.1.239 | `./flop-miner.sh commitids on` (the default since v1.0.0) |
 | `Inference (openai) error 500` / backend log `toploc binding required` | TOPLOC was switched off | `./flop-miner.sh toploc on` |
 | **tunnel down** chip | The tunnel was stopped, for example after a partial restart | Double-click Start (re-runs `up` with a fresh tunnel address) |
-| A gap of hours with no sessions | Either routing on Flop's side or the PC slept | Check that Windows didn't sleep (see the command after this table). If it didn't, it's routing; nothing to fix |
+| A gap of hours with no sessions | The worker is fenced, the PC slept, or Flop's routing | First `./flop-miner.sh fence`. Then check that Windows didn't sleep (command below). Then compare your images with `releases.json` (a new worker release can change routing) |
 | A few `calibration check failed … in 60s` lines | The public devnet RPC is slow for a moment | Ignore it unless it lasts over 15 minutes |
 | `\\wsl$` or `\\wsl.localhost` paths don't open | Some PCs don't expose the WSL share | Not needed: `install.ps1` copies files through a pipe |
 | A PowerShell one-liner behaves strangely | PowerShell expands `$(...)`, and 5.1 strips nested double quotes, before WSL sees the command | Wrap Linux commands in **single quotes**: `wsl -d flop-miner -- bash -lc '...'` |
@@ -305,9 +311,33 @@ Worker session lines from the last hour:
 wsl -d flop-miner -- bash -lc 'docker logs --since 60m flop-miner-worker-1 2>&1 | grep -i -e session -e error -e settle | tail -n 30'
 ```
 
+### No work for hours? Check the signer fence
+
+If the RPC connection drops while the worker waits for a transaction it sent, the worker cannot know whether that transaction landed. To stay safe it writes a **signer fence**: it stops signing, answers new sessions with `503`, and the gateway stops sending you work. The dashboard can stay green the whole time. The fence is kept in the worker's data volume, so **restarts and updates do not clear it**.
+
+Check it:
+
+```powershell
+wsl -d flop-miner --cd ~ -- ./flop-miner.sh fence
+```
+
+`fenced: yes` means you are locked out. Since v1.1.0, `setup` installs a guard that runs every 2 minutes, asks the chain whether the stuck transaction can still be included, and only when it can never land (its 512-block lifetime is over, nothing is pending, no session is open) keeps a copy of the fence, removes it and restarts the worker. It stops after 3 unlocks in 6 hours and leaves anything unexpected to you. Its log:
+
+```powershell
+wsl -d flop-miner --cd ~ -- sudo tail /opt/flop-miner/fence-guard/guard.log
+```
+
+Already set up before v1.1.0? Install it on its own (it checks every file's sha256 first):
+
+```powershell
+wsl -d flop-miner --cd ~ -- ./flop-miner.sh fence install
+```
+
+On the test PC, a drop storm around noon on 10 Nov 2026 fenced the worker; no session arrived for about 6 hours, through two restarts and an update. The guard's first run unlocked it, and the next session settled within minutes. The guard is by [UfukNode](https://github.com/UfukNode/flop-miner-setup); it works unchanged on worker v0.1.323.
+
 ## Updating and uninstalling
 
-**New Flop release.** When Flop publishes new images in `releases.json`, re-run setup and then Start. Setup is safe to repeat: it keeps your key, worker name and GPU setting, skips the sponsor if you are already registered, and pulls the new images by digest.
+**New Flop release.** When Flop publishes new images in `releases.json`, re-run setup and then Start. Setup is safe to repeat: it keeps your key, worker name and GPU setting, skips the sponsor if you are already registered, keeps the model already on disk, pulls the new images by digest and refreshes the fence guard. Then click Stop and Start so the new worker runs.
 
 ```powershell
 wsl -d flop-miner --cd ~ -- ./flop-miner.sh setup
@@ -338,7 +368,7 @@ Remove-Item "$([Environment]::GetFolderPath('Desktop'))\FLOP Miner - *.cmd"
 ## Credits
 
 - [Flop Labs](https://flop.finance) for the network, the official images and [`releases.json`](https://flop.network/releases.json), and to Flop's CTO for the `SESSION_COMMIT_IDS` fix within hours of the report.
-- The compose layout follows the community guide [UfukNode/FLOP-Miner-Kurulum](https://github.com/UfukNode/FLOP-Miner-Kurulum), reviewed line by line.
+- The compose layout follows the community guide [UfukNode/FLOP-Miner-Kurulum](https://github.com/UfukNode/FLOP-Miner-Kurulum), reviewed line by line, and the signer-fence guard is UfukNode's, from [flop-miner-setup](https://github.com/UfukNode/flop-miner-setup), pinned to a reviewed commit.
 - Related, by the same author: [flop-devnet-starter](https://github.com/Makabeez/flop-devnet-starter) (agent side: key, faucet, gateway chat) and [flop-devnet-board](https://github.com/Makabeez/flop-devnet-board) (a live board of every devnet miner).
 
 ## License

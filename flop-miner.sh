@@ -12,6 +12,9 @@
 #   - Exposure: nothing listens on your LAN. The only public entry is the Cloudflare tunnel to the
 #     worker's session port (127.0.0.1:8645), which refuses requests without SESSION_AUTH_TOKEN.
 #   - Secrets (miner seed, session seed, tokens) stay in /opt/flop-miner, mode 600; seeds root-owned.
+#   - One community tool, optional but installed by setup: the signer-fence guard from
+#     github.com/UfukNode/flop-miner-setup, downloaded at one reviewed commit and checked file by file
+#     against the sha256 values below before anything runs. It never signs or sends a transaction.
 #
 #   ./flop-miner.sh prereqs   once, first: Docker Engine + NVIDIA Container Toolkit from their official apt repos
 #   ./flop-miner.sh setup     once: verify official release list, settings, images, key, sponsor, model, tunnel
@@ -22,6 +25,7 @@
 #   ./flop-miner.sh sponsor   ask the sponsor (waits as long as it asks), or top up stake if calibration runs short
 #   ./flop-miner.sh toploc on|off   switch the optional TOPLOC activation proof (kept across restarts)
 #   ./flop-miner.sh commitids on|off   SESSION_COMMIT_IDS (Flop Labs' fix for the V2 leaf + TOPLOC error, 8 Nov 2026)
+#   ./flop-miner.sh fence     signer-fence status; `fence install` sets up the guard that clears a fence safely
 #   ./flop-miner.sh down      stop worker, backend and tunnel (run before switching the PC off)
 #   ./flop-miner.sh version   print this script's version
 #
@@ -41,13 +45,24 @@ MODEL_SLUG=qwen/qwen2.5-0.5b-instruct
 GPU_UTIL_ARG="${GPU_UTIL:-}"; WORKER_NAME_ARG="${WORKER_NAME:-}"   # only override saved values when given
 GPU_UTIL="${GPU_UTIL:-0.6}"
 WORKER_NAME="${WORKER_NAME:-flop-pc-miner}"   # public label; choose yours: WORKER_NAME=alice-4090 ./flop-miner.sh setup
-VERSION=1.0.0
+VERSION=1.1.0
 # CLI v0.1.290 reports a verified model without an "ok" field, so the model check also accepts
 # verified_root == MODEL_HASH (the root the CLI recomputed from the files, compared with the chain).
 # Floor for the CLI image. On 7 Nov 2026 the chain moved to runtime spec 1014014 while releases.json still
 # listed cli v0.1.220 (supports up to 1014003), so model verification failed. v0.1.290 is published by the
 # same official org (ghcr.io/flop-labs) and lists 1014014 in SUPPORTED_SPEC_VERSIONS. The newer of the two wins.
 MIN_CLI=ghcr.io/flop-labs/flop-core/cli:v0.1.290@sha256:24e32b034b0d3600ee28127dad30d4228e623235f2dc62da34c2c85ba5e21a88
+# Signer-fence guard (community, UfukNode/flop-miner-setup), pinned to the commit reviewed for this repo.
+# If an RPC drop leaves a transaction unconfirmed, the worker "fences" its signer: it stops signing,
+# answers 503 and gets no gateway work, and restarts do not clear it. The guard clears it only once the
+# chain proves the stuck transaction can never be included (archives the fence first, max 3 per 6 h).
+FENCE_GUARD_COMMIT=ad2d5224cc6e258e8dadf47b9f98126e4816055b
+FENCE_GUARD_FILES="e606193fb5434997343ca7eee4a8d3177d49709d71120ba352101b02d139be2f fence-guard.sh
+4fb5788db9e51650912af01fcfd4da8483cbe0e5f9478406385eb76c466c43b7 status.mjs
+6d3b07d76a04a4b536c97e4d358cd5af25d74be99c31d5b877aefba4d9ba351d recover.mjs
+f0fcd78fe292ec50c7f985278039159790f9d1cd3663320454f3d290be4261c0 reconcile.mjs
+c2daba8e5af7729a24b15bb5d6d13db705797ebe8421cb8806bc638389056459 flop-fence-guard.service
+778986ac88ed04a9db7a3ba2841599b80d0c133a65b1163a264e98fe84076853 flop-fence-guard.timer"
 
 die()  { echo "error: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
@@ -317,7 +332,14 @@ cmd_setup() {
   fi
 
   step "model (the CLI checks every file against the on-chain record)"
-  local i
+  local i mdir="$D/models/qwen2.5-0.5b-instruct"
+  # The CLI writes a checkpoint only into an empty folder, so a second setup (e.g. after a new release)
+  # would fail here. A model already on disk is re-verified against the chain by the worker's model gate
+  # at every start ("model-gate OK" in the log). REFETCH_MODEL=1 moves the old copy aside and downloads again.
+  if [ -n "$(ls -A "$mdir" 2>/dev/null)" ] && [ "${REFETCH_MODEL:-0}" != 1 ]; then
+    echo "model already downloaded in $mdir; the worker's model gate re-verifies it at every start"
+  else
+  if [ -n "$(ls -A "$mdir" 2>/dev/null)" ]; then mv "$mdir" "$mdir.old.$(date +%s)"; echo "moved the old copy aside"; fi
   for i in 1 2 3; do
     if cli --network devnet --rpc "$RPC" model fetch "$MODEL_HASH" --precision BF16 \
          --output-dir /work/models/qwen2.5-0.5b-instruct --json \
@@ -325,6 +347,7 @@ cmd_setup() {
     [ "$i" -lt 3 ] || die "model fetch failed 3 times"
     echo "model fetch failed; retrying"; sleep 10
   done
+  fi
 
   step "tunnel (cloudflared from Cloudflare's signed apt repository)"
   if ! command -v cloudflared >/dev/null; then
@@ -353,8 +376,53 @@ ProtectHome=yes
 PrivateTmp=yes
 EOF
   sudo systemctl daemon-reload
+
+  step "signer-fence guard (community tool, pinned commit, checked by sha256)"
+  fence_install || echo "fence guard not installed (see above); setup continues. Retry: ./flop-miner.sh fence install"
   echo
   echo "setup done. Next: ./flop-miner.sh harden (then reopen the distro), then ./flop-miner.sh up"
+}
+
+# Is the worker's signer fenced? Asks the worker's own status endpoint from inside the container,
+# so the session token never appears on the host. Prints yes, no or unknown.
+fence_state() {
+  compose exec -T worker node -e '
+    fetch(`http://127.0.0.1:${process.env.SESSION_PORT||8645}/internal/signer-fence`,{headers:{Authorization:`Bearer ${process.env.SESSION_AUTH_TOKEN}`},signal:AbortSignal.timeout(10000)})
+      .then(r=>r.json()).then(j=>console.log(j.fenced===true?"yes":"no")).catch(()=>console.log("unknown"))' 2>/dev/null || echo unknown
+}
+
+# Download the guard at the pinned commit into a temporary folder, check every file's sha256, and only
+# then install it to $D/fence-guard (root-only) with a systemd timer that runs it every 2 minutes.
+fence_install() {
+  local base="https://raw.githubusercontent.com/UfukNode/flop-miner-setup/$FENCE_GUARD_COMMIT/fence-guard"
+  local tmp sum f
+  command -v flock >/dev/null || sudo apt-get install -y -qq util-linux >/dev/null
+  tmp=$(mktemp -d)
+  while read -r sum f; do
+    curl -fsS --proto '=https' -o "$tmp/$f" "$base/$f" || { rm -rf "$tmp"; echo "download failed: $f"; return 1; }
+    [ "$(sha256sum < "$tmp/$f" | cut -d' ' -f1)" = "$sum" ] || { rm -rf "$tmp"; echo "sha256 mismatch for $f: refusing to install"; return 1; }
+  done <<<"$FENCE_GUARD_FILES"
+  sudo install -d -m 700 -o root -g root "$D/fence-guard"
+  while read -r sum f; do
+    case "$f" in fence-guard.sh) sudo install -m 700 -o root -g root "$tmp/$f" "$D/fence-guard/$f" ;;
+      *.service|*.timer) sudo install -m 644 -o root -g root "$tmp/$f" "/etc/systemd/system/$f" ;;
+      *) sudo install -m 644 -o root -g root "$tmp/$f" "$D/fence-guard/$f" ;; esac   # same modes as the guard's own guide
+  done <<<"$FENCE_GUARD_FILES"
+  rm -rf "$tmp"
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now flop-fence-guard.timer >/dev/null 2>&1
+  echo "fence guard installed (commit ${FENCE_GUARD_COMMIT:0:7}, all 6 files match), timer: $(systemctl is-active flop-fence-guard.timer)"
+}
+
+cmd_fence() {
+  case "${1:-}" in
+    install) fence_install ;;
+    "")
+      echo "signer fenced: $(fence_state)"
+      echo "guard timer:   $(systemctl is-active flop-fence-guard.timer 2>/dev/null || true)"
+      sudo test -f "$D/fence-guard/guard.log" && sudo tail -n 5 "$D/fence-guard/guard.log" || true ;;
+    *) echo "Use: ./flop-miner.sh fence            (status)"; echo "     ./flop-miner.sh fence install    (install or refresh the guard)" ;;
+  esac
 }
 
 cmd_harden() {
@@ -435,6 +503,7 @@ cmd_status() {
   step "TOPLOC proof"; [ "$(envget TOPLOC_ENABLED)" = 0 ] && echo "OFF (plain V2 settlements)" || echo "ON"
   step "session commit ids"; [ "$(envget SESSION_COMMIT_IDS)" = 0 ] && echo "OFF" || echo "ON"
   step "tunnel"; echo "https://$(envget SESSION_PUBLIC_HOST)  ($(systemctl is-active flop-tunnel || true))"
+  step "signer fence"; echo "fenced: $(fence_state)  (guard timer: $(systemctl is-active flop-fence-guard.timer 2>/dev/null || true))"
   step "containers"; compose ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
   step "GPU"; nvidia-smi --query-gpu=power.draw,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv
   step "worker (last test jobs / calibration)"; compose logs worker 2>/dev/null | grep -E 'answered task|calibration' | tail -n 5 || true
@@ -489,8 +558,8 @@ cmd_down() {
 case "${1:-}" in
   prereqs) cmd_prereqs; exit ;;
   version) echo "flop-miner.sh $VERSION"; exit ;;
-  setup|harden|up|status|logs|sponsor|toploc|commitids|down) ;;
-  *)       sed -n '2,29p' "$0"; exit 1 ;;
+  setup|harden|up|status|logs|sponsor|toploc|commitids|fence|down) ;;
+  *)       sed -n '2,33p' "$0"; exit 1 ;;
 esac
 need_docker
 case "${1:-}" in
@@ -502,6 +571,7 @@ case "${1:-}" in
   sponsor) cmd_sponsor ;;
   toploc)  shift; cmd_toploc "${1:-}" ;;
   commitids) shift; cmd_commitids "${1:-}" ;;
+  fence)   shift; cmd_fence "${1:-}" ;;
   down)    cmd_down ;;
-  *)       sed -n '2,29p' "$0"; exit 1 ;;
+  *)       sed -n '2,33p' "$0"; exit 1 ;;
 esac
