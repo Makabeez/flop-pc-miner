@@ -45,7 +45,7 @@ MODEL_SLUG=qwen/qwen2.5-0.5b-instruct
 GPU_UTIL_ARG="${GPU_UTIL:-}"; WORKER_NAME_ARG="${WORKER_NAME:-}"   # only override saved values when given
 GPU_UTIL="${GPU_UTIL:-0.6}"
 WORKER_NAME="${WORKER_NAME:-flop-pc-miner}"   # public label; choose yours: WORKER_NAME=alice-4090 ./flop-miner.sh setup
-VERSION=1.1.0
+VERSION=1.1.1
 # CLI v0.1.290 reports a verified model without an "ok" field, so the model check also accepts
 # verified_root == MODEL_HASH (the root the CLI recomputed from the files, compared with the chain).
 # Floor for the CLI image. On 7 Nov 2026 the chain moved to runtime spec 1014014 while releases.json still
@@ -463,7 +463,7 @@ cmd_up() {
   since=$(date '+%Y-%m-%d %H:%M:%S')
   sudo systemctl restart flop-tunnel
   for i in $(seq 1 30); do
-    host=$(sudo journalctl -u flop-tunnel --since "$since" --no-pager | grep -o '[a-z0-9-]*\.trycloudflare\.com' | tail -n 1 || true)
+    host=$(sudo journalctl -u flop-tunnel --since "$since" --no-pager | grep -o '[a-z0-9-]*\.trycloudflare\.com' | grep -v '^api\.' | tail -n 1 || true)
     [ -n "$host" ] && break; sleep 2
   done
   [ -n "$host" ] || die "no tunnel address after 60 s: sudo journalctl -u flop-tunnel -n 30"
