@@ -35,6 +35,7 @@ STATE = {
     "drop_times": deque(maxlen=5000), "last_answer": None,
     "calib_lines": deque(maxlen=10), "events": deque(maxlen=60),
     "endpoint_ok": None, "log_since": None, "errors": {}, "update_needed": False,
+    "watchdog": {"restarts": 0, "last": None, "msg": None}, "wd_seen": None,
     "sess": {"opened": 0, "settled": 0, "failed": 0, "turns": 0, "gn": 0, "paid_raw": 0,
              "last_error": None, "last_open": None, "last_settle": None, "warnings": 0},
 }
@@ -107,7 +108,25 @@ def poll_containers():
         for c in items:
             rows[c.get("Service")] = {"state": c.get("State"), "status": c.get("Status")}
     rc2, out2, _ = sh(["systemctl", "is-active", "flop-tunnel"], 10)
+    # Chain watchdog (flop-miner.sh v1.3.0+): one line per action in /opt/flop-miner/watchdog.log.
+    wd = {"restarts": 0, "last": None, "msg": None}
+    try:
+        with open(os.path.join(D, "watchdog.log")) as f:
+            for line in f:
+                ts, _, msg = line.strip().partition(" ")
+                if msg.startswith("restarted") or msg.startswith("limit"):
+                    wd["restarts"] += msg.startswith("restarted")
+                    wd["last"], wd["msg"] = ts, msg
+    except OSError:
+        pass
     with LOCK:
+        if wd["last"] and wd["last"] != STATE["wd_seen"]:
+            if STATE["wd_seen"] is not None:
+                STATE["events"].append([wd["last"], "warn" if wd["msg"].startswith("restarted") else "bad", "watchdog: " + wd["msg"]])
+            STATE["wd_seen"] = wd["last"]
+        elif STATE["wd_seen"] is None:
+            STATE["wd_seen"] = ""
+        STATE["watchdog"] = wd
         STATE["containers"] = rows
         STATE["tunnel"] = {"active": out2.strip() == "active", "host": env_get("SESSION_PUBLIC_HOST")}
     note("containers", None if rc == 0 else (err or "docker compose ps failed"))
@@ -246,6 +265,7 @@ def snapshot():
                      "last_10m": sum(1 for t in STATE["answered_times"] if now - t < 600)},
             "drops_10m": sum(1 for t in STATE["drop_times"] if now - t < 600),
             "endpoint_ok": STATE["endpoint_ok"], "update_needed": STATE["update_needed"],
+            "watchdog": STATE["watchdog"],
             "sess": {**STATE["sess"], "paid": STATE["sess"]["paid_raw"] / 1e18},
             "calib_lines": list(STATE["calib_lines"]), "events": list(STATE["events"])[-25:][::-1],
             "errors": dict(STATE["errors"]),
@@ -403,6 +423,8 @@ function diffAlerts(d){if(!prev){prev=d;return}
  if(d.drops_10m>0&&!(prev.drops_10m>0))notify('FLOP: chain link dropping',`${d.drops_10m} disconnects in the last 10 min`,'warn');
  const wk=(d.containers||{}).worker||{},pw=(prev.containers||{}).worker||{};
  if(pw.state==='running'&&wk.state!=='running')notify('FLOP: worker stopped','The miner worker is no longer running','bad');
+ const wp=prev.watchdog||{},wn=d.watchdog||{};
+ if(wn.last&&wn.last!==wp.last&&wp.last!==undefined)notify(wn.msg&&wn.msg.startsWith('limit')?'FLOP: watchdog stopped restarting':'FLOP: worker restarted',(wn.msg||'').replace(/^restarted the worker: /,'')+'.',wn.msg&&wn.msg.startsWith('limit')?'bad':'warn');
  if(d.update_needed&&!prev.update_needed)notify('FLOP: update needed','Flop upgraded the chain. Double-click "FLOP Miner - Update".','bad');
  const pc=(prev.chain||{}).cap,c=(d.chain||{}).cap;if(pc!=null&&c!=null&&Number(c)!==Number(pc))notify('FLOP: calibration changed',`${pc} → ${c} GFLOP/s`,'warn');
  prev=d}

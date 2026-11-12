@@ -29,6 +29,7 @@
 #   ./flop-miner.sh commitids on|off   SESSION_COMMIT_IDS (Flop Labs' fix for the V2 leaf + TOPLOC error, 8 Nov 2026)
 #   ./flop-miner.sh fence     signer-fence status; `fence install` sets up the guard that clears a fence safely
 #   ./flop-miner.sh update    after Flop upgrades the chain: newest official images that support it, then restart
+#   ./flop-miner.sh watchdog  chain watchdog status; `watchdog install|off` (restarts a worker stuck after an RPC drop)
 #   ./flop-miner.sh down      stop worker, backend and tunnel (run before switching the PC off)
 #   ./flop-miner.sh version   print this script's version
 #
@@ -48,7 +49,7 @@ MODEL_SLUG=qwen/qwen2.5-0.5b-instruct
 GPU_UTIL_ARG="${GPU_UTIL:-}"; WORKER_NAME_ARG="${WORKER_NAME:-}"   # only override saved values when given
 GPU_UTIL="${GPU_UTIL:-0.6}"
 WORKER_NAME="${WORKER_NAME:-flop-pc-miner}"   # public label; choose yours: WORKER_NAME=alice-4090 ./flop-miner.sh setup
-VERSION=1.2.0
+VERSION=1.3.0
 # CLI v0.1.290 reports a verified model without an "ok" field, so the model check also accepts
 # verified_root == MODEL_HASH (the root the CLI recomputed from the files, compared with the chain).
 # Floor for the CLI image. The chain's runtime can move ahead of the CLI listed in releases.json: on 7 Nov 2026
@@ -454,6 +455,8 @@ EOF
 
   step "signer-fence guard (community tool, pinned commit, checked by sha256)"
   fence_install || echo "fence guard not installed (see above); setup continues. Retry: ./flop-miner.sh fence install"
+  step "chain watchdog (restarts the worker if an RPC drop leaves it disconnected)"
+  watchdog_install
   echo
   echo "setup done. Next: ./flop-miner.sh harden (then reopen the distro), then ./flop-miner.sh up"
 }
@@ -487,6 +490,89 @@ fence_install() {
   sudo systemctl daemon-reload
   sudo systemctl enable --now flop-fence-guard.timer >/dev/null 2>&1
   echo "fence guard installed (commit ${FENCE_GUARD_COMMIT:0:7}, all 6 files match), timer: $(systemctl is-active flop-fence-guard.timer)"
+}
+
+# --- chain watchdog ----------------------------------------------------------------------------------
+# After an RPC drop (websocket 1006) the official worker can lose its chain connection for good: the
+# container stays up, logs nothing more, and the gateway stops routing to it. On the test PC this happened
+# on 12 Nov 2026 at 17:01 and at 20:20; each time only a restart brought it back. The watchdog runs every
+# minute (systemd timer, as your user, no root) and restarts the worker container when ALL of these hold:
+#   - the worker is running (it never starts a miner you stopped),
+#   - it logged a chain drop, more than 3 minutes ago, and logged no activity since,
+#   - the chain RPC answers again,
+#   - it has not restarted the worker in the last 20 minutes, nor 6 times in 6 hours.
+# Same container, tunnel and settings; it only restarts it. Log: /opt/flop-miner/watchdog.log
+WATCHDOG_SCRIPT=$(cat <<'WD'
+#!/usr/bin/env bash
+# flop-pc-miner chain watchdog (installed by flop-miner.sh; see the comment there for the rules).
+set -uo pipefail
+D=/opt/flop-miner; C=flop-miner-worker-1; LOG=$D/watchdog.log
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
+[ "$(docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null)" = true ] || exit 0
+started=$(docker inspect -f '{{.State.StartedAt}}' "$C") || exit 0
+lines=$(docker logs -t --since "$started" "$C" 2>&1 | tail -n 5000)
+last_drop=$(grep -E '1006|WebSocket is not connected' <<<"$lines" | tail -n 1 | cut -d' ' -f1)
+[ -n "$last_drop" ] || exit 0
+# Any normal worker output after the drop (a session, a test job, an endpoint ad) means it is alive.
+alive=$(awk -v t="${last_drop:0:19}" 'substr($1,1,19) > t' <<<"$lines" \
+        | grep -vE '1006|not connected|[Ee]rror|    at ' | grep -cE 'session|nonce|Endpoint ad|calibration' || true)
+[ "${alive:-0}" -gt 0 ] && exit 0
+now=$(date +%s); age=$(( now - $(date -d "$last_drop" +%s) ))
+[ "$age" -ge 180 ] || exit 0
+curl -fsS -m 15 -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' https://rpc.devnet.flop.network >/dev/null 2>&1 || exit 0
+recent=$(grep ' restarted ' "$LOG" 2>/dev/null | while read -r t _; do echo $(( now - $(date -d "$t" +%s) )); done)
+[ -n "$recent" ] && [ "$(sort -n <<<"$recent" | head -n 1)" -lt 1200 ] && exit 0
+if [ "$(awk '$1 < 21600' <<<"$recent" | grep -c .)" -ge 6 ]; then
+  tail -n 1 "$LOG" 2>/dev/null | grep -q ' limit ' || log "limit 6 restarts in 6 h reached; not restarting. Check the PC's network."
+  exit 0
+fi
+docker restart -t 30 "$C" >/dev/null 2>&1 \
+  && log "restarted the worker: chain connection dropped at ${last_drop:0:19}Z, no activity for $(( age / 60 )) min" \
+  || log "restart failed"
+WD
+)
+
+watchdog_install() {
+  printf '%s\n' "$WATCHDOG_SCRIPT" > "$D/chain-watchdog.sh" && chmod 755 "$D/chain-watchdog.sh"
+  touch "$D/watchdog.log"
+  sudo tee /etc/systemd/system/flop-chain-watchdog.service >/dev/null <<EOF
+[Unit]
+Description=flop-pc-miner: restart the worker after it lost its chain connection
+After=docker.service
+
+[Service]
+Type=oneshot
+User=$USER
+ExecStart=$D/chain-watchdog.sh
+EOF
+  sudo tee /etc/systemd/system/flop-chain-watchdog.timer >/dev/null <<'EOF'
+[Unit]
+Description=flop-pc-miner chain watchdog, every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now flop-chain-watchdog.timer >/dev/null 2>&1
+  echo "chain watchdog installed, timer: $(systemctl is-active flop-chain-watchdog.timer 2>/dev/null || true)"
+}
+watchdog_line() {
+  local last; last=$(grep ' restarted ' "$D/watchdog.log" 2>/dev/null | tail -n 1 | cut -c1-19 || true)
+  echo "chain watchdog: $(systemctl is-active flop-chain-watchdog.timer 2>/dev/null || echo off)  (last restart: ${last:-never})"
+}
+cmd_watchdog() {
+  case "${1:-}" in
+    install) watchdog_install ;;
+    off) sudo systemctl disable --now flop-chain-watchdog.timer >/dev/null 2>&1 || true; echo "chain watchdog off. Turn on: ./flop-miner.sh watchdog install" ;;
+    "") watchdog_line; tail -n 5 "$D/watchdog.log" 2>/dev/null || true ;;
+    *) echo "Use: ./flop-miner.sh watchdog [install|off]" ;;
+  esac
 }
 
 cmd_fence() {
@@ -589,6 +675,7 @@ cmd_status() {
   step "session commit ids"; [ "$(envget SESSION_COMMIT_IDS)" = 0 ] && echo "OFF" || echo "ON"
   step "tunnel"; echo "https://$(envget SESSION_PUBLIC_HOST)  ($(systemctl is-active flop-tunnel || true))"
   step "signer fence"; echo "fenced: $(fence_state)  (guard timer: $(systemctl is-active flop-fence-guard.timer 2>/dev/null || true))"
+  watchdog_line
   step "containers"; compose ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
   step "GPU"; nvidia-smi --query-gpu=power.draw,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv
   step "worker (last test jobs / calibration)"; compose logs worker 2>/dev/null | grep -E 'answered task|calibration' | tail -n 5 || true
@@ -645,6 +732,10 @@ cmd_update() {
   old_policy=$(envget DECODE_POLICY_HASH)
   worker_img=$(newer_img "$REL_WORKER" "$old_worker"); backend_img=$(newer_img "$REL_BACKEND" "$old_backend")
 
+  if [ "$(systemctl is-active flop-chain-watchdog.timer 2>/dev/null)" != active ]; then
+    step "chain watchdog (new in v1.3.0)"; watchdog_install
+  fi
+
   step "CLI for this chain"
   cli_img=$(pick_cli "$REL_CLI") || die "no published CLI works with the chain right now (or the chain is unreachable). Flop usually publishes one within hours: retry later"
 
@@ -695,8 +786,8 @@ cmd_down() {
 case "${1:-}" in
   prereqs) cmd_prereqs; exit ;;
   version) echo "flop-miner.sh $VERSION"; exit ;;
-  setup|harden|up|status|logs|sponsor|toploc|commitids|fence|update|down) ;;
-  *)       sed -n '2,36p' "$0"; exit 1 ;;
+  setup|harden|up|status|logs|sponsor|toploc|commitids|fence|update|watchdog|down) ;;
+  *)       sed -n '2,37p' "$0"; exit 1 ;;
 esac
 need_docker
 case "${1:-}" in
@@ -710,6 +801,7 @@ case "${1:-}" in
   commitids) shift; cmd_commitids "${1:-}" ;;
   fence)   shift; cmd_fence "${1:-}" ;;
   update)  cmd_update ;;
+  watchdog) shift; cmd_watchdog "${1:-}" ;;
   down)    cmd_down ;;
-  *)       sed -n '2,36p' "$0"; exit 1 ;;
+  *)       sed -n '2,37p' "$0"; exit 1 ;;
 esac

@@ -17,7 +17,7 @@
 
 </div>
 
-> **Installed before 12 Nov 2026? Update once.** On 11 Nov 2026 Flop upgraded the devnet chain (runtime 1014020). A miner on the older images keeps a green dashboard but gets no work: Status shows `RUNTIME_INCOMPATIBLE`. Download this repo again, re-run `install.ps1` ([step 2](#2-get-this-repo-and-run-the-installer)), then double-click the new **FLOP Miner - Update** shortcut. From now on, Update is all a chain upgrade needs. [Details](#updating-and-uninstalling)
+> **Installed before 12 Nov 2026? Update once.** On 11 Nov 2026 Flop upgraded the devnet chain (runtime 1014020). A miner on the older images keeps a green dashboard but gets no work: Status shows `RUNTIME_INCOMPATIBLE`. Download this repo again, re-run `install.ps1` ([step 2](#2-get-this-repo-and-run-the-installer)), then double-click the new **FLOP Miner - Update** shortcut. From now on, Update is all a chain upgrade needs. The same Update also installs the new [chain watchdog](#no-work-after-a-chain-drop-the-chain-watchdog) (v1.3.0). [Details](#updating-and-uninstalling)
 
 > **It works.** This setup runs a home RTX 5080 miner (`5ECEvG31…ffKvW`, Soft tier, 28 GFLOP/s cap). After Flop Labs' fix on 8 Nov 2026, **11 of the next 13 gateway sessions settled on chain within 5½ hours, including every one of the last 10 (6.43 test FLOP)**. The first settlement was [`0x65e921ec…a3be`](https://explorer.devnet.flop.network/transactions/0x65e921ec5cb965e88b712a2d552d5194a550e21a785b3229cceecfea188ba3be): 134 GFLOP served, 0.8138 FLOP to the miner. Every error that came up on the way, and its fix, is in [Troubleshooting](#troubleshooting).
 
@@ -96,6 +96,7 @@ Everything here was written to be checked, not trusted:
 - **A new, devnet-only key.** `setup` generates a fresh miner key inside the distro and never prints it. Your real wallets are never involved, and nothing ever asks for a seed phrase. The seed files are root-owned, mode `600`, in `/opt/flop-miner`.
 - **The stake comes from Flop's sponsor.** The sponsor request sends only your miner address, a timestamp and a signature, and the script refuses to sign if the sponsor reports a different chain.
 - **One community tool, pinned and checked.** `setup` installs the signer-fence guard from [UfukNode/flop-miner-setup](https://github.com/UfukNode/flop-miner-setup/tree/ad2d5224cc6e258e8dadf47b9f98126e4816055b/fence-guard), downloaded at one reviewed commit and checked file by file against sha256 values in `flop-miner.sh` before anything is installed. It only reads the chain and never signs or sends a transaction ([what it does](#no-work-for-hours-check-the-signer-fence)).
+- **One watchdog of its own.** The chain watchdog is written inside `flop-miner.sh`, runs as your user (not root) and can do one thing: restart the worker container after a dead chain connection ([rules](#no-work-after-a-chain-drop-the-chain-watchdog)). It reads only the worker's log and the chain's public RPC.
 - **The dashboard is local and read-only.** It binds to `127.0.0.1:8650` and never reads or serves your seeds or tokens.
 
 Read [`flop-miner.sh`](flop-miner.sh) before running it. It is one file, and every step is commented.
@@ -187,6 +188,7 @@ What `setup` does, in order:
 6. Downloads the model with Flop's CLI, which checks every file against the on-chain record. On a later run it keeps the copy already on disk: the worker re-verifies it at every start (`model-gate OK`).
 7. Installs cloudflared and the `flop-tunnel` service.
 8. Installs the signer-fence guard and its 2-minute timer ([why](#no-work-for-hours-check-the-signer-fence)).
+9. Installs the chain watchdog and its 1-minute timer ([why](#no-work-after-a-chain-drop-the-chain-watchdog)).
 
 ### 5. Lock the distro down (recommended)
 
@@ -292,6 +294,7 @@ Every one of these happened on the test PC.
 | `MODEL_VERIFICATION_FAILED`, or `RUNTIME_INCOMPATIBLE` from the CLI only | The CLI in `releases.json` can lag the chain runtime (7 Nov and 11 Nov 2026) | Already handled since v1.2.0: setup and update test the CLI against the live chain and, if needed, use the newest official CLI tag that works |
 | Sessions fail with `TOPLOC evidence required for settlement but incomplete (selected=[0] published=[])` → `RefundNoSlash` | On the test PC (11–12 Nov 2026) the worker log showed `da.register` failing while the chain link dropped (`1006`) and the worker was older than the chain runtime. Refunded, not slashed | Run Update. If it keeps happening on current images with a stable chain link, Stop, wait 30 s, Start, and report it to Flop |
 | `MODEL_VERIFICATION_FAILED` … `--output-dir … is not empty` when re-running setup | The CLI only writes a model into an empty folder | Fixed in v1.1.0: setup keeps the model already on disk (the worker re-verifies it). Force a fresh copy with `REFETCH_MODEL=1 ./flop-miner.sh setup` |
+| Healthy dashboard, but **no sessions for hours**; the worker log ends with `1006 … Abnormal Closure` and `WebSocket is not connected`, and nothing after | The chain connection dropped and the worker never reconnected (seen twice on 12 Nov 2026) | Since v1.3.0 the [chain watchdog](#no-work-after-a-chain-drop-the-chain-watchdog) restarts it within about 4 minutes and the dashboard alerts you. By hand: Stop, Start |
 | Healthy dashboard, but **no sessions for hours**; `./flop-miner.sh fence` says `fenced: yes` | An RPC drop left a transaction unconfirmed, so the worker locked its signer and answers `503` | The fence guard clears it, usually within ~20 min. See [the signer fence](#no-work-for-hours-check-the-signer-fence). Never delete the fence file by hand |
 | Host has internet but the **container doesn't** (`chain … drops`, `mailbox unreachable`, raw TCP from the worker times out) | WSL's network path into Docker broke | Stop, wait 30 s, Start. Stop terminates the distro, which resets it; restarting only the worker does not |
 | Calibration `No response received from RPC endpoint`, chain link dropping, `1006` every ~13 s | WSL's link MTU (1280 on some PCs) is smaller than Docker's 1500 | Already handled: `up` matches the miner network's MTU to `eth0` |
@@ -317,6 +320,25 @@ Worker session lines from the last hour:
 ```powershell
 wsl -d flop-miner -- bash -lc 'docker logs --since 60m flop-miner-worker-1 2>&1 | grep -i -e session -e error -e settle | tail -n 30'
 ```
+
+### No work after a chain drop? The chain watchdog
+
+Sometimes the worker's connection to the chain drops (`1006 … Abnormal Closure`) and never comes back. The worker keeps running and the dashboard stays green, but the worker logs nothing more and the gateway stops sending it work. On the test PC this happened twice on 12 Nov 2026, at 17:01 and at 20:20, and each time the miner sat idle until it was restarted by hand.
+
+Since v1.3.0, `setup` and `update` install a small watchdog (in this repo, runs as your user, no root) that checks once a minute. It restarts the worker container only when all of these are true:
+
+- the worker is running (it never starts a miner you stopped),
+- the worker logged a chain drop more than 3 minutes ago and has done nothing since (no session, test job or endpoint ad),
+- the chain answers again,
+- it has not restarted the worker in the last 20 minutes, or 6 times in the last 6 hours.
+
+The restart keeps the same tunnel and settings. Each restart is logged, and the dashboard and widget alert you (`FLOP: worker restarted`). Check it:
+
+```powershell
+wsl -d flop-miner --cd ~ -- ./flop-miner.sh watchdog
+```
+
+Turn it off with `./flop-miner.sh watchdog off`, back on with `./flop-miner.sh watchdog install`. If it ever logs that it reached the 6-restarts limit, the PC's network is dropping too often: check Wi-Fi power saving, VPNs and sleep settings.
 
 ### No work for hours? Check the signer fence
 
@@ -350,7 +372,7 @@ On the test PC, a drop storm around noon on 10 Nov 2026 fenced the worker; no se
 wsl -d flop-miner --cd ~ -- ./flop-miner.sh update
 ```
 
-It reads the official `releases.json`, never downgrades an image, checks which CLI the live chain accepts (if the one in `releases.json` is too old, it tries newer version tags of the same official image), pulls everything by digest and restarts the miner if it was running. Your key, worker name, GPU and TOPLOC settings stay as they are. It prints old → new versions, or `already up to date`.
+It installs the chain watchdog if it isn't there yet, reads the official `releases.json`, never downgrades an image, checks which CLI the live chain accepts (if the one in `releases.json` is too old, it tries newer version tags of the same official image), pulls everything by digest and restarts the miner if it was running. Your key, worker name, GPU and TOPLOC settings stay as they are. It prints old → new versions, or `already up to date`.
 
 Running `./flop-miner.sh setup` again also works (it keeps your key and settings, skips the sponsor and keeps the model), and is the way to refresh the fence guard.
 
