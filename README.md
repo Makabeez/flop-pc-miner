@@ -17,6 +17,8 @@
 
 </div>
 
+> **Installed before 12 Nov 2026? Update once.** On 11 Nov 2026 Flop upgraded the devnet chain (runtime 1014020). A miner on the older images keeps a green dashboard but gets no work: Status shows `RUNTIME_INCOMPATIBLE`. Download this repo again, re-run `install.ps1` ([step 2](#2-get-this-repo-and-run-the-installer)), then double-click the new **FLOP Miner - Update** shortcut. From now on, Update is all a chain upgrade needs. [Details](#updating-and-uninstalling)
+
 > **It works.** This setup runs a home RTX 5080 miner (`5ECEvG31…ffKvW`, Soft tier, 28 GFLOP/s cap). After Flop Labs' fix on 8 Nov 2026, **11 of the next 13 gateway sessions settled on chain within 5½ hours, including every one of the last 10 (6.43 test FLOP)**. The first settlement was [`0x65e921ec…a3be`](https://explorer.devnet.flop.network/transactions/0x65e921ec5cb965e88b712a2d552d5194a550e21a785b3229cceecfea188ba3be): 134 GFLOP served, 0.8138 FLOP to the miner. Every error that came up on the way, and its fix, is in [Troubleshooting](#troubleshooting).
 
 > **Devnet only.** Devnet FLOP has no value. Flop Labs says devnet mining earns no rewards and no airdrop weight, and the chain may be reset. Do it to learn, to test, and to be an early working miner. Not affiliated with Flop Labs.
@@ -55,7 +57,7 @@ This repo wraps them for a **Windows PC with an NVIDIA GPU**:
 
 - `flop-miner.sh`: one script that installs, verifies, registers, starts and stops everything inside a dedicated WSL2 distro
 - `flop-dash.py`: a live local dashboard and a compact widget, with sound alerts
-- `windows/`: an installer and five Desktop shortcuts (Start, Stop, Status, Dashboard, Widget)
+- `windows/`: an installer and six Desktop shortcuts (Start, Stop, Status, Update, Dashboard, Widget)
 
 You never need a terminal open while mining.
 
@@ -156,7 +158,7 @@ cd flop-pc-miner-main
 powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
 ```
 
-The installer copies `flop-miner.sh` and `flop-dash.py` into the distro (it prints the sha1 of each copied file) and puts five `FLOP Miner - …` shortcuts on your Desktop. It downloads nothing and needs no admin rights.
+The installer copies `flop-miner.sh` and `flop-dash.py` into the distro (it prints the sha1 of each copied file) and puts six `FLOP Miner - …` shortcuts on your Desktop. It downloads nothing and needs no admin rights.
 
 ### 3. Install Docker and the NVIDIA toolkit inside the distro
 
@@ -213,7 +215,8 @@ In the first few hours the network runs **calibration**: a burst of test jobs th
 |---|---|
 | **FLOP Miner - Start** | Starts the tunnel, backend, worker and dashboard. Closing its window does **not** stop mining. |
 | **FLOP Miner - Stop** | Stops everything and shuts the distro down. **Run it before switching the PC off.** |
-| **FLOP Miner - Status** | On-chain registration, stake and calibration, plus tunnel, containers, GPU and recent jobs |
+| **FLOP Miner - Status** | On-chain registration, stake and calibration, plus versions, tunnel, containers, GPU and recent jobs |
+| **FLOP Miner - Update** | After Flop upgrades the chain: moves the miner to the newest official images that support it and restarts it. Keeps your key and settings. |
 | **FLOP Miner - Dashboard** | Opens the live dashboard in your browser |
 | **FLOP Miner - Widget** | A compact always-available window (Edge app mode) |
 
@@ -285,7 +288,9 @@ Every one of these happened on the test PC.
 |---|---|---|
 | `run this inside the flop-miner WSL distro` | A plain `wsl` opened your default distro | Always use `wsl -d flop-miner` |
 | Sponsor: `503`, `signer balance too low`, `auto_miner_cap_full` | The sponsor is down, out of funds, or full (40 uncalibrated miners max) | Nothing; the script waits `retryAfterSeconds` and retries. Or run `./flop-miner.sh sponsor` later |
-| `MODEL_VERIFICATION_FAILED` | The CLI in `releases.json` is older than the chain runtime | Already handled: the script uses the official CLI v0.1.290 or newer from the same org |
+| **Dashboard green, but no sessions or test jobs for hours.** Status says `RUNTIME_INCOMPATIBLE … Unsupported runtime spec version`, the dashboard shows **update needed** (v1.2.0+) | Flop upgraded the chain (runtime 1014020 on 11 Nov 2026). Before v1.2.0 the images only changed when you re-ran setup, so the worker stayed on the old release and the gateway stopped routing to it | Double-click **FLOP Miner - Update** (or `./flop-miner.sh update`). Check with Status: it should list `registered`, `stake` and `calibration` again. Sessions can take an hour or more to come back |
+| `MODEL_VERIFICATION_FAILED`, or `RUNTIME_INCOMPATIBLE` from the CLI only | The CLI in `releases.json` can lag the chain runtime (7 Nov and 11 Nov 2026) | Already handled since v1.2.0: setup and update test the CLI against the live chain and, if needed, use the newest official CLI tag that works |
+| Sessions fail with `TOPLOC evidence required for settlement but incomplete (selected=[0] published=[])` → `RefundNoSlash` | On the test PC (11–12 Nov 2026) the worker log showed `da.register` failing while the chain link dropped (`1006`) and the worker was older than the chain runtime. Refunded, not slashed | Run Update. If it keeps happening on current images with a stable chain link, Stop, wait 30 s, Start, and report it to Flop |
 | `MODEL_VERIFICATION_FAILED` … `--output-dir … is not empty` when re-running setup | The CLI only writes a model into an empty folder | Fixed in v1.1.0: setup keeps the model already on disk (the worker re-verifies it). Force a fresh copy with `REFETCH_MODEL=1 ./flop-miner.sh setup` |
 | Healthy dashboard, but **no sessions for hours**; `./flop-miner.sh fence` says `fenced: yes` | An RPC drop left a transaction unconfirmed, so the worker locked its signer and answers `503` | The fence guard clears it, usually within ~20 min. See [the signer fence](#no-work-for-hours-check-the-signer-fence). Never delete the fence file by hand |
 | Host has internet but the **container doesn't** (`chain … drops`, `mailbox unreachable`, raw TCP from the worker times out) | WSL's network path into Docker broke | Stop, wait 30 s, Start. Stop terminates the distro, which resets it; restarting only the worker does not |
@@ -295,7 +300,7 @@ Every one of these happened on the test PC.
 | **tunnel down** chip | The tunnel was stopped, for example after a partial restart | Double-click Start (re-runs `up` with a fresh tunnel address) |
 | `up` prints `public address: https://api.trycloudflare.com`, then the tunnel goes down again | cloudflared could not reach Cloudflare (usually the PC itself was offline) and `up` before v1.1.1 mistook the API address in its error for a tunnel | Fixed in v1.1.1: `up` ignores that address and stops with `no tunnel address after 60 s`. Check the PC's own internet first, then Start again |
 | The **PC** loses internet while other devices on the same network don't; afterwards containers fail with `WSL environment detected but no adapters were found` | Suspected on the test PC: power saving on its Realtek 2.5GbE card. Resetting WSL during the outage then made it lose the GPU | In an admin PowerShell: `Set-NetAdapterAdvancedProperty -Name Ethernet -RegistryKeyword EnableGreenEthernet -RegistryValue 0` (same for `GigaLite` and `PowerSavingMode`), then `Restart-NetAdapter -Name Ethernet`. Don't restart the miner while the PC is offline. To get the GPU back, reboot |
-| A gap of hours with no sessions | The worker is fenced, the PC slept, or Flop's routing | First `./flop-miner.sh fence`. Then check that Windows didn't sleep (command below). Then compare your images with `releases.json` (a new worker release can change routing) |
+| A gap of hours with no sessions | The chain was upgraded, the worker is fenced, the PC slept, or Flop's routing | First Status (if it says the chain was upgraded, run Update). Then `./flop-miner.sh fence`. Then check that Windows didn't sleep (command below). Then compare your images with `releases.json` (a new worker release can change routing) |
 | A few `calibration check failed … in 60s` lines | The public devnet RPC is slow for a moment | Ignore it unless it lasts over 15 minutes |
 | `\\wsl$` or `\\wsl.localhost` paths don't open | Some PCs don't expose the WSL share | Not needed: `install.ps1` copies files through a pipe |
 | A PowerShell one-liner behaves strangely | PowerShell expands `$(...)`, and 5.1 strips nested double quotes, before WSL sees the command | Wrap Linux commands in **single quotes**: `wsl -d flop-miner -- bash -lc '...'` |
@@ -339,13 +344,17 @@ On the test PC, a drop storm around noon on 10 Nov 2026 fenced the worker; no se
 
 ## Updating and uninstalling
 
-**New Flop release.** When Flop publishes new images in `releases.json`, re-run setup and then Start. Setup is safe to repeat: it keeps your key, worker name and GPU setting, skips the sponsor if you are already registered, keeps the model already on disk, pulls the new images by digest and refreshes the fence guard. Then click Stop and Start so the new worker runs.
+**New Flop release or chain upgrade.** Double-click **FLOP Miner - Update**, or:
 
 ```powershell
-wsl -d flop-miner --cd ~ -- ./flop-miner.sh setup
+wsl -d flop-miner --cd ~ -- ./flop-miner.sh update
 ```
 
-**New version of this repo.** Download it again (step 2) and re-run `install.ps1`.
+It reads the official `releases.json`, never downgrades an image, checks which CLI the live chain accepts (if the one in `releases.json` is too old, it tries newer version tags of the same official image), pulls everything by digest and restarts the miner if it was running. Your key, worker name, GPU and TOPLOC settings stay as they are. It prints old → new versions, or `already up to date`.
+
+Running `./flop-miner.sh setup` again also works (it keeps your key and settings, skips the sponsor and keeps the model), and is the way to refresh the fence guard.
+
+**New version of this repo.** Download it again (step 2) and re-run `install.ps1`. Check the version with `wsl -d flop-miner --cd ~ -- ./flop-miner.sh version`.
 
 **Uninstall.** This deletes the distro, including the miner key and everything in it:
 

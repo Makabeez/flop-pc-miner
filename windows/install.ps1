@@ -2,7 +2,7 @@
   flop-pc-miner - Windows installer / updater (https://github.com/Makabeez/flop-pc-miner, MIT)
 
   Copies flop-miner.sh and flop-dash.py into the "flop-miner" WSL distro and puts the
-  Start / Stop / Status / Dashboard / Widget shortcuts on your Desktop. Run it again any time to update.
+  Start / Stop / Status / Update / Dashboard / Widget shortcuts on your Desktop. Run it again any time to update.
   It does not download anything and does not need administrator rights.
 
   Run from the repo folder, in a normal PowerShell window:

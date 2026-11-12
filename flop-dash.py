@@ -34,7 +34,7 @@ STATE = {
     "answered_total": 0, "answered_times": deque(maxlen=5000),
     "drop_times": deque(maxlen=5000), "last_answer": None,
     "calib_lines": deque(maxlen=10), "events": deque(maxlen=60),
-    "endpoint_ok": None, "log_since": None, "errors": {},
+    "endpoint_ok": None, "log_since": None, "errors": {}, "update_needed": False,
     "sess": {"opened": 0, "settled": 0, "failed": 0, "turns": 0, "gn": 0, "paid_raw": 0,
              "last_error": None, "last_open": None, "last_settle": None, "warnings": 0},
 }
@@ -190,6 +190,11 @@ def poll_chain():
         note("chain", "miner key or CLI image not found"); return
     rc, out, err = sh(["docker", "run", "--rm", "--network", "host", cli, "--network", "devnet", "--rpc", RPC,
                        "miner", "status", addr, "--json"], 90)
+    # Flop upgraded the chain and this CLI (and usually the worker) is too old: ./flop-miner.sh update fixes it.
+    with LOCK:
+        STATE["update_needed"] = "RUNTIME_INCOMPATIBLE" in (out or "") + (err or "")
+    if STATE["update_needed"]:
+        note("chain", "chain runtime upgraded: run ./flop-miner.sh update (Update shortcut)"); return
     try:
         d = json.loads(out)
     except ValueError:
@@ -240,7 +245,7 @@ def snapshot():
             "jobs": {"total": STATE["answered_total"], "last": STATE["last_answer"],
                      "last_10m": sum(1 for t in STATE["answered_times"] if now - t < 600)},
             "drops_10m": sum(1 for t in STATE["drop_times"] if now - t < 600),
-            "endpoint_ok": STATE["endpoint_ok"],
+            "endpoint_ok": STATE["endpoint_ok"], "update_needed": STATE["update_needed"],
             "sess": {**STATE["sess"], "paid": STATE["sess"]["paid_raw"] / 1e18},
             "calib_lines": list(STATE["calib_lines"]), "events": list(STATE["events"])[-25:][::-1],
             "errors": dict(STATE["errors"]),
@@ -398,6 +403,7 @@ function diffAlerts(d){if(!prev){prev=d;return}
  if(d.drops_10m>0&&!(prev.drops_10m>0))notify('FLOP: chain link dropping',`${d.drops_10m} disconnects in the last 10 min`,'warn');
  const wk=(d.containers||{}).worker||{},pw=(prev.containers||{}).worker||{};
  if(pw.state==='running'&&wk.state!=='running')notify('FLOP: worker stopped','The miner worker is no longer running','bad');
+ if(d.update_needed&&!prev.update_needed)notify('FLOP: update needed','Flop upgraded the chain. Double-click "FLOP Miner - Update".','bad');
  const pc=(prev.chain||{}).cap,c=(d.chain||{}).cap;if(pc!=null&&c!=null&&Number(c)!==Number(pc))notify('FLOP: calibration changed',`${pc} → ${c} GFLOP/s`,'warn');
  prev=d}
 
@@ -415,10 +421,10 @@ function render(d){
  const c=d.containers||{},be=c.backend||{},wk=c.worker||{},ch=d.chain||{},cal=ch.calibration||{},g=d.gpu||{},st=d.settle,s=d.sess||{};
  $('gpuname').textContent=g.name?'· '+g.name.replace(/^NVIDIA (GeForce )?/,''):'';
  const running=be.state==='running'&&wk.state==='running';
- const health=!running?'bad':(d.drops_10m||d.endpoint_ok===false||!d.tunnel.active)?'warn':'ok';
+ const health=(!running||d.update_needed)?'bad':(d.drops_10m||d.endpoint_ok===false||!d.tunnel.active)?'warn':'ok';
  $('pulse').className='pulse '+health;favicon({ok:'#3DDC97',warn:'#F4B942',bad:'#F25F5C'}[health]);
  $('addr').innerHTML=d.address?`${esc(d.worker)} · <a href="${esc(d.explorer)}" target="_blank" rel="noopener">${esc(d.address)}</a> · dashboard up ${dur(d.uptime)}`:'miner key not found';
- $('chips').innerHTML=chip(running?'mining':'stopped',running?'ok':'bad')
+ $('chips').innerHTML=(d.update_needed?chip('update needed','bad'):'')+chip(running?'mining':'stopped',running?'ok':'bad')
   +chip('tunnel '+(d.tunnel.active?'up':'down'),d.tunnel.active?'ok':'bad')
   +chip('chain '+(d.drops_10m?d.drops_10m+' drops/10m':'stable'),d.drops_10m?'bad':(running?'ok':''))
   +chip('mailbox '+(d.endpoint_ok===null?'…':d.endpoint_ok?'ok':'unreachable'),d.endpoint_ok?'ok':d.endpoint_ok===false?'bad':'')
@@ -430,7 +436,7 @@ function render(d){
  const sessCls=s.settled?'good':s.failed?'bad':'';
  const sessSub=total?`${s.failed||0} failed · ${s.turns||0} turn${s.turns===1?'':'s'}${s.paid?` · ${s.paid.toFixed(4)} FLOP`:''}${s.last_error&&!(s.last_settle&&s.last_settle>s.last_error[0])?`<br><span style="color:var(--red)">last error ${esc(ago(s.last_error[0]))}: ${esc(shortErr(s.last_error[1]))}</span>`:s.last_settle?`<br><span style="color:var(--green)">last settled ${esc(ago(s.last_settle))}${s.last_error?' · no failures since':''}</span>`:''}`:'waiting for the gateway to open one';
  const C={
-  cap:card('Calibration cap',ch.cap!=null?`${esc(ch.cap)} <small>GFLOP/s</small>`:'—',ch.cap!=null?`tier ${esc(cal.assurance_tier||cal.assuranceTier||cal.tier||'?')} · checked ${ch.age!=null?Math.round(ch.age)+'s ago':'…'}`:(ch.registered?'waiting for calibration':'reading chain…'),ch.cap!=null?'cyan':'warn'),
+  cap:card('Calibration cap',ch.cap!=null?`${esc(ch.cap)} <small>GFLOP/s</small>`:'—',ch.cap!=null?`tier ${esc(cal.assurance_tier||cal.assuranceTier||cal.tier||'?')} · checked ${ch.age!=null?Math.round(ch.age)+'s ago':'…'}`:(d.update_needed?'chain upgraded: double-click Update':ch.registered?'waiting for calibration':'reading chain…'),ch.cap!=null?'cyan':'warn'),
   sess:card('Gateway sessions',`${s.settled||0}<small> settled / ${total} opened</small>`,sessSub,sessCls,total?sessBar:'',true),
   paid:card('Paid on chain',st?`${st.count}`:'…',st?`${st.paid.toLocaleString(undefined,{maximumFractionDigits:4})} test FLOP${st.last?' · last '+ago(new Date(st.last).toISOString()):''}`:'reading indexer…',st&&st.count?'good':''),
   jobs:card('Test jobs',`${d.jobs.total}`,`${d.jobs.last_10m} in 10 min · last ${ago(d.jobs.last)}`),
@@ -444,7 +450,7 @@ function render(d){
  $('gpuline').textContent=g.name?`${g.name}${d.tunnel.host?' · public endpoint https://'+d.tunnel.host:''}`:'';
  $('feed').innerHTML=(d.events||[]).map(e=>`<li><span class="t">${esc(hhmm(e[0]))}</span><span class="${esc(e[1])}">${esc(e[2])}</span></li>`).join('')||'<li><span></span><span class="job">no worker activity yet</span></li>';
  $('errs').innerHTML=Object.entries(d.errors||{}).map(([k,v])=>`<div class="err">${esc(k)}: ${esc(v)}</div>`).join('');
- if(!flashMsg)document.title=`${{ok:'🟢',warn:'🟡',bad:'🔴'}[health]} ${ch.cap!=null?ch.cap+' GFLOP/s':'FLOP'} · ${s.settled||0}/${total} sess · ${g.power!=null?g.power.toFixed(0)+' W':''}`;
+ if(!flashMsg)document.title=`${{ok:'🟢',warn:'🟡',bad:'🔴'}[health]} ${d.update_needed?'update needed · ':''}${ch.cap!=null?ch.cap+' GFLOP/s':'FLOP'} · ${s.settled||0}/${total} sess · ${g.power!=null?g.power.toFixed(0)+' W':''}`;
  diffAlerts(d)}
 async function tick(){try{const r=await fetch('/api',{cache:'no-store'});render(await r.json())}catch(e){$('pulse').className='pulse bad';favicon('#F25F5C');$('chips').innerHTML=chip('dashboard offline: start the miner','bad');document.title='🔴 FLOP miner offline'}}
 tick();setInterval(tick,3000);

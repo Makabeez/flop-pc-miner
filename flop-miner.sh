@@ -5,6 +5,8 @@
 # Trust model (everything below is checked by this script, nothing is taken from third parties):
 #   - Container images: only ghcr.io/flop-labs/flop-core/* (the official github.com/flop-labs org),
 #     pulled by sha256 digest exactly as listed in Flop's official https://flop.network/releases.json.
+#     One exception: when the chain runs a newer runtime than the CLI in releases.json supports, the CLI
+#     is the newest version tag of that same official image that works with the live chain (pinned by digest).
 #   - Model hash and decode policy: taken from that same official releases.json.
 #   - Sponsor request: the documented POST https://faucet.flop.network/sponsor/miner, signed message
 #     "flop-sponsor/v1|miner|<genesis>|<address>|<issuedAt>"; only address + signature leave the PC.
@@ -26,6 +28,7 @@
 #   ./flop-miner.sh toploc on|off   switch the optional TOPLOC activation proof (kept across restarts)
 #   ./flop-miner.sh commitids on|off   SESSION_COMMIT_IDS (Flop Labs' fix for the V2 leaf + TOPLOC error, 8 Nov 2026)
 #   ./flop-miner.sh fence     signer-fence status; `fence install` sets up the guard that clears a fence safely
+#   ./flop-miner.sh update    after Flop upgrades the chain: newest official images that support it, then restart
 #   ./flop-miner.sh down      stop worker, backend and tunnel (run before switching the PC off)
 #   ./flop-miner.sh version   print this script's version
 #
@@ -45,13 +48,15 @@ MODEL_SLUG=qwen/qwen2.5-0.5b-instruct
 GPU_UTIL_ARG="${GPU_UTIL:-}"; WORKER_NAME_ARG="${WORKER_NAME:-}"   # only override saved values when given
 GPU_UTIL="${GPU_UTIL:-0.6}"
 WORKER_NAME="${WORKER_NAME:-flop-pc-miner}"   # public label; choose yours: WORKER_NAME=alice-4090 ./flop-miner.sh setup
-VERSION=1.1.1
+VERSION=1.2.0
 # CLI v0.1.290 reports a verified model without an "ok" field, so the model check also accepts
 # verified_root == MODEL_HASH (the root the CLI recomputed from the files, compared with the chain).
-# Floor for the CLI image. On 7 Nov 2026 the chain moved to runtime spec 1014014 while releases.json still
-# listed cli v0.1.220 (supports up to 1014003), so model verification failed. v0.1.290 is published by the
-# same official org (ghcr.io/flop-labs) and lists 1014014 in SUPPORTED_SPEC_VERSIONS. The newer of the two wins.
-MIN_CLI=ghcr.io/flop-labs/flop-core/cli:v0.1.290@sha256:24e32b034b0d3600ee28127dad30d4228e623235f2dc62da34c2c85ba5e21a88
+# Floor for the CLI image. The chain's runtime can move ahead of the CLI listed in releases.json: on 7 Nov 2026
+# (runtime 1014014, releases.json cli v0.1.220) and again on 11 Nov 2026 (runtime 1014020, releases.json
+# cli v0.1.321, both too old). v0.1.342 is published by the same official org and supports 1014020.
+# setup and update start from the newer of this floor and releases.json, test it against the live chain,
+# and if the chain rejects it, try newer version tags of the same official image (see pick_cli).
+MIN_CLI=ghcr.io/flop-labs/flop-core/cli:v0.1.342@sha256:8972372a89f804909c483e1d3578dd57642e88ef0c01fbca26cf2276176775e1
 # Signer-fence guard (community, UfukNode/flop-miner-setup), pinned to the commit reviewed for this repo.
 # If an RPC drop leaves a transaction unconfirmed, the worker "fences" its signer: it stops signing,
 # answers 503 and gets no gateway work, and restarts do not clear it. The guard clears it only once the
@@ -81,6 +86,92 @@ compose() { docker compose --env-file "$D/miner.env" -f "$D/docker-compose.yml" 
 address() { [ -f "$D/address" ] || die "no miner key yet: run ./flop-miner.sh setup"; cat "$D/address"; }
 backend_ready() {
   compose exec -T backend python3 -c 'import os, urllib.request as u; u.urlopen(u.Request("http://127.0.0.1:8000/health", headers={"Authorization": "Bearer " + os.environ["INFERENCE_API_KEY"]}), timeout=5)' >/dev/null 2>&1
+}
+
+# --- official release list and image versions ---------------------------------------------------------
+# Reads releases.json into REL_CLI, REL_WORKER, REL_BACKEND, REL_POLICY_HASH, REL_POLICY (all validated).
+load_release() {
+  local rel img
+  rel=$(curl -fsS --proto '=https' "$RELEASES_URL") || die "cannot read $RELEASES_URL"
+  REL_CLI=$(jq -r '.cli.image' <<<"$rel")
+  REL_WORKER=$(jq -r '."miner-worker".image' <<<"$rel")
+  REL_BACKEND=$(jq -r '."miner-vllm-toploc".image' <<<"$rel")
+  for img in "$REL_CLI" "$REL_WORKER" "$REL_BACKEND"; do
+    valid_ref "$img" || die "release list returned an unexpected image reference: $img"
+    echo "  $img"
+  done
+  jq -e --arg m "$MODEL_HASH" '.models[$m].name' <<<"$rel" >/dev/null || die "model $MODEL_HASH is not in the official release list"
+  REL_POLICY_HASH=$(jq -r --arg m "$MODEL_HASH" '.models[$m].decode_policies | keys[0]' <<<"$rel")
+  [[ "$REL_POLICY_HASH" =~ ^0x[0-9a-f]{64}$ ]] || die "no decode policy for the model in the release list"
+  REL_POLICY=$(jq -c --arg m "$MODEL_HASH" --arg p "$REL_POLICY_HASH" '.models[$m].decode_policies[$p]' <<<"$rel")
+  echo "  model $MODEL_HASH ($MODEL_NAME), decode policy $REL_POLICY_HASH"
+}
+valid_ref() { [[ "$1" =~ ^ghcr\.io/flop-labs/flop-core/[a-z0-9-]+:v[0-9.]+@sha256:[0-9a-f]{64}$ ]]; }
+img_ver()   { sed -E 's/.*:v([0-9.]+)@.*/\1/' <<<"$1"; }
+img_tag()   { sed -E 's/.*:(v[0-9.]+)@.*/\1/' <<<"$1"; }
+# The newer of two image references by version tag (an empty or invalid one loses).
+newer_img() {
+  valid_ref "${2:-}" || { echo "$1"; return; }
+  valid_ref "${1:-}" || { echo "$2"; return; }
+  if [ "$(printf '%s\n%s\n' "$(img_ver "$1")" "$(img_ver "$2")" | sort -V | tail -n 1)" = "$(img_ver "$1")" ]; then echo "$1"; else echo "$2"; fi
+}
+# Runtime spec version the live chain runs (JSON-RPC over HTTPS on the same endpoint).
+chain_spec() {
+  curl -fsS --proto '=https' -m 20 -H 'Content-Type: application/json' \
+    -d '{"id":1,"jsonrpc":"2.0","method":"state_getRuntimeVersion","params":[]}' "${RPC/wss:/https:}" \
+    | jq -r '.result.specVersion // empty' 2>/dev/null || true
+}
+# Read-only, anonymous access to the official image repository (the same API `docker pull` uses).
+GHCR_ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+ghcr_token() { curl -fsS --proto '=https' -m 20 "https://ghcr.io/token?scope=repository:flop-labs/flop-core/$1:pull" | jq -r '.token // empty'; }
+ghcr_tags() {   # version tags of one official image, oldest first
+  local t; t=$(ghcr_token "$1") && [ -n "$t" ] || return 1
+  curl -fsS --proto '=https' -m 30 -H "Authorization: Bearer $t" "https://ghcr.io/v2/flop-labs/flop-core/$1/tags/list?n=1000" \
+    | jq -r '.tags[]?' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V
+}
+ghcr_ref() {    # image + tag -> reference pinned by the digest the registry serves for that tag
+  local t d; t=$(ghcr_token "$1") && [ -n "$t" ] || return 1
+  d=$(curl -fsSI --proto '=https' -m 20 -H "Authorization: Bearer $t" -H "Accept: $GHCR_ACCEPT" \
+        "https://ghcr.io/v2/flop-labs/flop-core/$1/manifests/$2" | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" {print $2}')
+  [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  echo "ghcr.io/flop-labs/flop-core/$1:$2@$d"
+}
+# Does this CLI image work with the live chain? 0 yes, 1 runtime too new for it, 2 cannot tell (pull or RPC failed).
+cli_fits() {
+  local out who try
+  docker pull -q "$1" >/dev/null 2>&1 || docker pull -q "$1" >/dev/null 2>&1 || return 2
+  who=$(cat "$D/address" 2>/dev/null || echo 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY)   # any address makes it connect
+  for try in 1 2; do
+    out=$(docker run --rm --network host "$1" --network devnet --rpc "$RPC" miner status "$who" --json 2>&1 || true)
+    grep -q RUNTIME_INCOMPATIBLE <<<"$out" && return 1
+    grep -q '"registered"' <<<"$out" && return 0
+    grep -qiE 'RPC_UNREACHABLE|not connected|timed out' <<<"$out" || return 0
+    [ "$try" = 1 ] && sleep 10
+  done
+  return 2
+}
+# Picks the CLI to use: the newer of releases.json's and MIN_CLI (and the current one), if the chain accepts it;
+# otherwise the newest official version tag above it that the chain accepts. Prints the reference;
+# progress goes to stderr. Fails if the chain cannot be reached or no published CLI supports its runtime yet.
+pick_cli() {
+  local best rc tag ref tried=0
+  best=$(newer_img "$1" "$MIN_CLI"); best=$(newer_img "$best" "$(envget FLOP_CLI 2>/dev/null || true)")
+  rc=0; cli_fits "$best" || rc=$?
+  case $rc in
+    0) echo "  cli $(img_tag "$best") works with the chain" >&2; echo "$best"; return 0 ;;
+    2) echo "  could not check cli $(img_tag "$best") against the chain (pull failed or RPC unreachable)" >&2; return 2 ;;
+  esac
+  echo "  cli $(img_tag "$best") does not support the chain's runtime; trying newer official CLI tags" >&2
+  for tag in $(ghcr_tags cli | tac); do
+    [ "$(printf '%s\n%s\n' "${tag#v}" "$(img_ver "$best")" | sort -V | tail -n 1)" = "${tag#v}" ] || break
+    [ "${tag#v}" = "$(img_ver "$best")" ] && break
+    tried=$((tried + 1)); [ "$tried" -le 8 ] || break
+    ref=$(ghcr_ref cli "$tag") || continue
+    rc=0; cli_fits "$ref" || rc=$?
+    [ "$rc" = 0 ] && { echo "  cli $tag works with the chain" >&2; echo "$ref"; return 0; }
+    echo "  cli $tag: $( [ "$rc" = 1 ] && echo 'too old as well' || echo 'could not check')" >&2
+  done
+  return 1
 }
 
 write_compose() {
@@ -257,27 +348,11 @@ cmd_setup() {
   sudo apt-get update -qq && sudo apt-get install -y -qq jq openssl curl ca-certificates >/dev/null
 
   step "official release list: $RELEASES_URL"
-  local rel cli_img worker_img backend_img policy_hash policy img
-  rel=$(curl -fsS --proto '=https' "$RELEASES_URL") || die "cannot read $RELEASES_URL"
-  cli_img=$(jq -r '.cli.image' <<<"$rel")
-  worker_img=$(jq -r '."miner-worker".image' <<<"$rel")
-  backend_img=$(jq -r '."miner-vllm-toploc".image' <<<"$rel")
-  for img in "$cli_img" "$worker_img" "$backend_img"; do
-    [[ "$img" =~ ^ghcr\.io/flop-labs/flop-core/[a-z0-9-]+:v[0-9.]+@sha256:[0-9a-f]{64}$ ]] \
-      || die "release list returned an unexpected image reference: $img"
-    echo "  $img"
-  done
-  jq -e --arg m "$MODEL_HASH" '.models[$m].name' <<<"$rel" >/dev/null || die "model $MODEL_HASH is not in the official release list"
-  policy_hash=$(jq -r --arg m "$MODEL_HASH" '.models[$m].decode_policies | keys[0]' <<<"$rel")
-  [[ "$policy_hash" =~ ^0x[0-9a-f]{64}$ ]] || die "no decode policy for the model in the release list"
-  policy=$(jq -c --arg m "$MODEL_HASH" --arg p "$policy_hash" '.models[$m].decode_policies[$p]' <<<"$rel")
-  echo "  model $MODEL_HASH ($MODEL_NAME), decode policy $policy_hash"
-  local rel_v min_v
-  rel_v=$(sed -E 's/.*:v([0-9.]+)@.*/\1/' <<<"$cli_img"); min_v=$(sed -E 's/.*:v([0-9.]+)@.*/\1/' <<<"$MIN_CLI")
-  if [ "$(printf '%s\n%s\n' "$rel_v" "$min_v" | sort -V | tail -n 1)" != "$rel_v" ]; then
-    echo "  cli v$rel_v in the release list is older than the chain needs; using official $MIN_CLI"
-    cli_img="$MIN_CLI"
-  fi
+  local cli_img worker_img backend_img policy_hash policy
+  load_release
+  worker_img=$REL_WORKER; backend_img=$REL_BACKEND; policy_hash=$REL_POLICY_HASH; policy=$REL_POLICY
+  echo "  chain runtime: $(chain_spec)"
+  cli_img=$(pick_cli "$REL_CLI") || die "no published CLI works with the chain right now (or the chain is unreachable); retry later"
 
   step "settings in $D"
   sudo install -d -o "$USER" -g "$USER" -m 700 "$D"
@@ -497,9 +572,19 @@ cmd_up() {
 cmd_status() {
   local a; a=$(address)
   step "miner $a"
-  cli --network devnet --rpc "$RPC" miner status "$a" --json | jq '{registered, stake, calibration}' || true
+  local out err; err=$(mktemp)
+  out=$(cli --network devnet --rpc "$RPC" miner status "$a" --json 2>"$err") || true
+  if grep -q RUNTIME_INCOMPATIBLE "$err" <(echo "$out"); then
+    echo "Flop upgraded the chain (runtime $(chain_spec)) and these images are too old for it."
+    echo "Fix: ./flop-miner.sh update   (or double-click \"FLOP Miner - Update\")"
+  else
+    jq '{registered, stake, calibration}' <<<"$out" 2>/dev/null || tail -n 5 "$err"
+  fi
+  rm -f "$err"
   echo "explorer: https://explorer.devnet.flop.network/account/$a"
   echo "board:    https://flop-devnet-board.vercel.app"
+  step "versions"
+  echo "worker $(img_tag "$(envget FLOP_WORKER_IMAGE)") · backend $(img_tag "$(envget FLOP_BACKEND_IMAGE)") · cli $(img_tag "$(envget FLOP_CLI)") · chain runtime $(chain_spec) · script $VERSION"
   step "TOPLOC proof"; [ "$(envget TOPLOC_ENABLED)" = 0 ] && echo "OFF (plain V2 settlements)" || echo "ON"
   step "session commit ids"; [ "$(envget SESSION_COMMIT_IDS)" = 0 ] && echo "OFF" || echo "ON"
   step "tunnel"; echo "https://$(envget SESSION_PUBLIC_HOST)  ($(systemctl is-active flop-tunnel || true))"
@@ -547,6 +632,58 @@ cmd_commitids() {
   compose exec -T worker printenv SESSION_COMMIT_IDS 2>/dev/null | sed 's/^/worker sees SESSION_COMMIT_IDS=/' || true
 }
 
+# After Flop upgrades the chain or publishes new images: refresh the images (never downgrades), pick a CLI
+# the live chain accepts, pull, and restart the miner if it was running. Keeps every setting and the key.
+cmd_update() {
+  [ -f "$D/miner.env" ] || die "nothing to update yet: run ./flop-miner.sh setup first"
+  address >/dev/null
+  step "official release list: $RELEASES_URL"
+  load_release
+  local spec cli_img worker_img backend_img old_cli old_worker old_backend old_policy was_running=0 changed=0
+  spec=$(chain_spec); echo "  chain runtime: ${spec:-unknown}"
+  old_cli=$(envget FLOP_CLI); old_worker=$(envget FLOP_WORKER_IMAGE); old_backend=$(envget FLOP_BACKEND_IMAGE)
+  old_policy=$(envget DECODE_POLICY_HASH)
+  worker_img=$(newer_img "$REL_WORKER" "$old_worker"); backend_img=$(newer_img "$REL_BACKEND" "$old_backend")
+
+  step "CLI for this chain"
+  cli_img=$(pick_cli "$REL_CLI") || die "no published CLI works with the chain right now (or the chain is unreachable). Flop usually publishes one within hours: retry later"
+
+  step "images by digest from ghcr.io/flop-labs"
+  envset FLOP_CLI "$cli_img"
+  envset FLOP_WORKER_IMAGE "$worker_img"
+  envset FLOP_BACKEND_IMAGE "$backend_img"
+  envset DECODE_POLICY_HASH "$REL_POLICY_HASH"
+  envset DECODE_POLICY "'$REL_POLICY'"
+  chmod 600 "$D/miner.env"
+  write_compose
+  compose config -q || die "docker-compose.yml did not validate"
+  [ "$backend_img" != "$old_backend" ] && echo "  new backend image: about 23 GB to download, this takes a while"
+  compose pull -q
+  local name old new
+  for name in cli worker backend; do
+    case $name in cli) old=$old_cli new=$cli_img ;; worker) old=$old_worker new=$worker_img ;; backend) old=$old_backend new=$backend_img ;; esac
+    if [ "$old" = "$new" ]; then echo "  $name $(img_tag "$new") (unchanged)"; else echo "  $name $(img_tag "$old") -> $(img_tag "$new")"; changed=1; fi
+  done
+  [ "$old_policy" = "$REL_POLICY_HASH" ] || { echo "  decode policy changed -> $REL_POLICY_HASH"; changed=1; }
+
+  # The CLI is only used for checks, so a CLI-only change needs no restart.
+  if [ "$worker_img" = "$old_worker" ] && [ "$backend_img" = "$old_backend" ] && [ "$old_policy" = "$REL_POLICY_HASH" ]; then
+    echo; [ "$changed" = 1 ] && echo "updated (no restart needed)." || echo "already up to date."
+    return
+  fi
+  compose ps --status running --services 2>/dev/null | grep -qx worker && was_running=1
+  if [ "$was_running" = 0 ]; then
+    echo; echo "updated. The miner is stopped: the new images run at the next ./flop-miner.sh up (Start shortcut)."; return
+  fi
+  step "restarting the miner on the new images"
+  cmd_up
+  sleep 30
+  if compose logs --since 2m worker 2>/dev/null | grep -qiE 'RUNTIME_INCOMPATIBLE|Unsupported runtime spec'; then
+    echo "warning: the worker still reports the chain runtime as unsupported. Flop has not published a worker for"
+    echo "runtime ${spec:-?} yet; run ./flop-miner.sh update again later."
+  fi
+}
+
 cmd_sponsor() { if is_registered; then echo "already registered; asking for a stake top-up"; fi; sponsor_until_ok "${SPONSOR_TRIES:-48}"; }
 cmd_logs()    { compose logs -f --tail 50 worker; }
 cmd_down() {
@@ -558,8 +695,8 @@ cmd_down() {
 case "${1:-}" in
   prereqs) cmd_prereqs; exit ;;
   version) echo "flop-miner.sh $VERSION"; exit ;;
-  setup|harden|up|status|logs|sponsor|toploc|commitids|fence|down) ;;
-  *)       sed -n '2,33p' "$0"; exit 1 ;;
+  setup|harden|up|status|logs|sponsor|toploc|commitids|fence|update|down) ;;
+  *)       sed -n '2,36p' "$0"; exit 1 ;;
 esac
 need_docker
 case "${1:-}" in
@@ -572,6 +709,7 @@ case "${1:-}" in
   toploc)  shift; cmd_toploc "${1:-}" ;;
   commitids) shift; cmd_commitids "${1:-}" ;;
   fence)   shift; cmd_fence "${1:-}" ;;
+  update)  cmd_update ;;
   down)    cmd_down ;;
-  *)       sed -n '2,33p' "$0"; exit 1 ;;
+  *)       sed -n '2,36p' "$0"; exit 1 ;;
 esac
