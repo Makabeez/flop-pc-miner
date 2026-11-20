@@ -17,6 +17,8 @@
 
 </div>
 
+> **Feedback to Flop Labs (20 Nov 2026):** five issues that two weeks of home mining ran into, with data and suggested fixes: [FEEDBACK.md](FEEDBACK.md).
+
 > **Installed before 12 Nov 2026? Update once.** On 11 Nov 2026 Flop upgraded the devnet chain (runtime 1014020). A miner on the older images keeps a green dashboard but gets no work: Status shows `RUNTIME_INCOMPATIBLE`. Download this repo again, re-run `install.ps1` ([step 2](#2-get-this-repo-and-run-the-installer)), then double-click the new **FLOP Miner - Update** shortcut. From now on, Update is all a chain upgrade needs. The same Update also installs the new [chain watchdog](#no-work-after-a-chain-drop-the-chain-watchdog) (v1.3.0). [Details](#updating-and-uninstalling)
 
 > **It works.** This setup runs a home RTX 5080 miner (`5ECEvG31…ffKvW`, Soft tier, 28 GFLOP/s cap). After Flop Labs' fix on 8 Nov 2026, **11 of the next 13 gateway sessions settled on chain within 5½ hours, including every one of the last 10 (6.43 test FLOP)**. The first settlement was [`0x65e921ec…a3be`](https://explorer.devnet.flop.network/transactions/0x65e921ec5cb965e88b712a2d552d5194a550e21a785b3229cceecfea188ba3be): 134 GFLOP served, 0.8138 FLOP to the miner. Every error that came up on the way, and its fix, is in [Troubleshooting](#troubleshooting).
