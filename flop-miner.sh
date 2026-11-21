@@ -45,11 +45,15 @@ MAILBOX=https://mailbox.devnet.flop.network
 GENESIS=0x99c172c095340ace980631f9123544c6bebd4839f3437e463533422d8be2d631
 MODEL_HASH=0x1a52c1abe781db051e70ae357f72bb70161ca0c092df0b618f22a9292ba63306
 MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
+# The Hugging Face commit whose files reproduce MODEL_HASH (a dm-verity root, "verity-v1"). Since CLI v0.1.418
+# (20 Nov 2026) `model fetch` downloads a verity-v1 model only at an explicit --revision, and the DA copy it
+# would fall back to is not publicly reachable. Checked 21 Nov 2026: this revision reproduces MODEL_HASH.
+MODEL_REVISION=7ae557604adf67be50417f59c2c2f167def9a775
 MODEL_SLUG=qwen/qwen2.5-0.5b-instruct
 GPU_UTIL_ARG="${GPU_UTIL:-}"; WORKER_NAME_ARG="${WORKER_NAME:-}"   # only override saved values when given
 GPU_UTIL="${GPU_UTIL:-0.6}"
 WORKER_NAME="${WORKER_NAME:-flop-pc-miner}"   # public label; choose yours: WORKER_NAME=alice-4090 ./flop-miner.sh setup
-VERSION=1.3.0
+VERSION=1.3.1
 # CLI v0.1.290 reports a verified model without an "ok" field, so the model check also accepts
 # verified_root == MODEL_HASH (the root the CLI recomputed from the files, compared with the chain).
 # Floor for the CLI image. The chain's runtime can move ahead of the CLI listed in releases.json: on 7 Nov 2026
@@ -417,7 +421,7 @@ cmd_setup() {
   else
   if [ -n "$(ls -A "$mdir" 2>/dev/null)" ]; then mv "$mdir" "$mdir.old.$(date +%s)"; echo "moved the old copy aside"; fi
   for i in 1 2 3; do
-    if cli --network devnet --rpc "$RPC" model fetch "$MODEL_HASH" --precision BF16 \
+    if cli --network devnet --rpc "$RPC" model fetch "$MODEL_HASH" --precision BF16 --revision "$MODEL_REVISION" \
          --output-dir /work/models/qwen2.5-0.5b-instruct --json \
          | jq -e --arg r "${MODEL_HASH#0x}" '(.ok == true) or (.verified_root == $r)' >/dev/null; then echo "model ok (verified root matches the chain)"; break; fi
     [ "$i" -lt 3 ] || die "model fetch failed 3 times"
